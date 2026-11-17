@@ -116,6 +116,11 @@ SHELL_ALLOWLIST=python3:pytest:git    # ':' 分隔；空/未设置 = 不限制
 - 空列表 = 不限制，**由 core 审批把关**。这一栏是运维的收口，不是本模块的审批层。
 - `shell_which` 同样受白名单约束，否则它会变成"白名单外有哪些命令"的探测面。
 
+> **白名单不是沙箱。** 放行 `python3` 等于放行任意代码（`python3 -c ...` 就是完整
+> 逃逸）；根目录里放一个同名可执行文件也能被 `./python3` 调用，因为比对的是
+> basename。这个开关只回答"这台机器上允许出现哪些命令名"，不回答"命令能做什么"。
+> 后一个问题由容器与 core 审批回答。
+
 ### 7. 错误码与信息
 
 | 码 | 何时 |
@@ -130,6 +135,20 @@ SHELL_ALLOWLIST=python3:pytest:git    # ':' 分隔；空/未设置 = 不限制
 `INVALID_ARGUMENT` 只带**相对根**的 cwd（根显示为 `"."`）。环境变量也从不进入
 错误文本。`test_errors_never_leak_absolute_paths` /
 `test_error_messages_do_not_contain_the_environment` 钉住这两条。
+
+## Frame ceiling（部署前必读）
+
+v1 传输没有分片，一帧明文上限 65519 字节（`limits.max_payload`）。本模块
+stdout/stderr **各 64 KiB 是本地上限**（防内存与上下文放大），但 64 KiB 的单个流
+JSON 包装后就已经超过一帧：这样的结果**发不出去**，transport 会以
+`PAYLOAD_TOO_LARGE` 断开（fatal）。
+
+所以连 core 部署时，单次调用实际可送达的输出约 **60 KiB 总量**（stdout + stderr +
+JSON 包装共用一帧）。这是有意的取舍：截断阈值不随部署方式变化，`truncated` 的语义
+在哪里都一致。需要更多输出时，让命令把结果写进根目录里的文件，再用 `fs_read`
+分块读回来——shell 只负责跑，不负责搬运大块数据。
+
+`--standalone` 不经过 transport，不受此限。
 
 ## 布局
 
