@@ -1,0 +1,64 @@
+{
+  "capabilities": {
+    "tools": [
+      {
+        "description": "在受限工作目录中执行单个命令（不经过 shell）：返回 exit_code/stdout/stderr；超时 kill 整个进程组并返回 timed_out=true；每个流最多 64 KiB",
+        "idempotent": false,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "cwd": {
+              "default": ".",
+              "type": "string"
+            },
+            "timeout_s": {
+              "default": 30,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        "name": "shell_exec",
+        "risk": "high",
+        "timeout_ms": 130000
+      },
+      {
+        "description": "在 PATH 中解析命令的绝对路径；未找到时 path 为 null（只接受裸命令名，不接受路径）",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "name": "shell_which",
+        "risk": "low",
+        "timeout_ms": 10000
+      }
+    ]
+  },
+  "concurrency": "pooled",
+  "display_name": "命令模块",
+  "instance_id": "main",
+  "limits": {
+    "max_concurrency": 2,
+    "max_payload": 65519
+  },
+  "module_id": "com.example.shell",
+  "priority": 0,
+  "protocol": "vade/v1",
+  "role": "tool",
+  "version": "1.0.0"
+}

@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test deps
+        # vade-sdk is deliberately NOT installed: tests/test_server.py skips
+        # itself, and tests/test_tools.py must stay runnable on a bare Python.
+        run: python -m pip install -U pip pytest
+      - name: Tools tests (no SDK needed)
+        run: python -m pytest tests -q
+      - name: Manifest is generated, not hand-edited
+        # The committed manifest must be byte-identical to what the app emits.
+        # This step only runs when the SDK is available in the checkout.
+        run: |
+          if python -c "import vade_sdk" 2>/dev/null; then
+            PYTHONPATH=src python -m shell_module --print-manifest | diff - manifest.json
+          else
+            echo "vade-sdk not installed; manifest check skipped (see tests/test_server.py)"
+          fi
