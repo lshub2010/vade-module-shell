@@ -14,6 +14,7 @@ binary guaranteed to exist in the environment running the suite.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import sys
@@ -77,7 +78,12 @@ def test_no_sdk_import_in_tools():
 
 
 def test_documented_limits():
-    assert tools.MAX_OUTPUT_BYTES == 64 * 1024
+    # One result budget shared by both streams, chosen to fit one v1 frame
+    # (65519 plaintext bytes) with the JSON envelope still inside it.
+    assert tools.MAX_RESULT_BYTES == 48 * 1024
+    assert tools.MAX_STREAM_BYTES == tools.MAX_RESULT_BYTES // 2
+    assert tools.MAX_STREAM_BYTES * 2 <= tools.MAX_RESULT_BYTES
+    assert tools.MAX_RESULT_BYTES < tools.FRAME_PLAINTEXT_BYTES
     assert tools.MAX_COMMAND_BYTES == 32 * 1024
     assert (tools.MIN_TIMEOUT_S, tools.MAX_TIMEOUT_S) == (1, 120)
 
@@ -337,7 +343,12 @@ def test_partial_output_before_a_timeout_is_returned(box: Sandbox):
 # ---------------------------------------------------------------------------- size
 
 
-def test_each_stream_is_capped_at_64_kib(box: Sandbox):
+def _result_bytes(result: dict) -> int:
+    """Bytes the SDK puts on the wire: compact JSON, UTF-8, non-ASCII kept."""
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def test_each_stream_is_capped_at_half_the_budget(box: Sandbox):
     command = box.script(
         "flood.py",
         "import sys\n"
@@ -346,16 +357,76 @@ def test_each_stream_is_capped_at_64_kib(box: Sandbox):
     )
     result = tools.shell_exec(command)
     assert result["exit_code"] == 0
-    assert len(result["stdout"]) == tools.MAX_OUTPUT_BYTES
-    assert len(result["stderr"]) == tools.MAX_OUTPUT_BYTES
+    assert len(result["stdout"]) <= tools.MAX_STREAM_BYTES
+    assert len(result["stderr"]) <= tools.MAX_STREAM_BYTES
+    assert len(result["stdout"]) + len(result["stderr"]) <= tools.MAX_RESULT_BYTES
     assert result["truncated"] is True
 
 
-def test_not_truncated_at_exactly_the_cap(box: Sandbox):
-    command = box.script("exact.py", "import sys\nsys.stdout.write('x' * 65536)\n")
+def test_both_streams_together_stay_within_one_result_budget(box: Sandbox):
+    """Two 40 kB streams: each is legal alone, together they must still fit.
+
+    This is the bug the shared budget exists for — per-stream caps that add up
+    to more than a frame produce a result the transport refuses to send.
+    """
+    command = box.script(
+        "both.py",
+        "import sys\n"
+        "sys.stdout.write('o' * 40_000)\n"
+        "sys.stderr.write('e' * 40_000)\n",
+    )
     result = tools.shell_exec(command)
-    assert len(result["stdout"]) == tools.MAX_OUTPUT_BYTES
+    assert result["truncated"] is True
+    assert len(result["stdout"]) + len(result["stderr"]) <= tools.MAX_RESULT_BYTES
+    assert _result_bytes(result) <= tools.MAX_RESULT_BYTES
+    # The whole JSON result, envelope included, is inside one v1 frame.
+    assert _result_bytes(result) < tools.FRAME_PLAINTEXT_BYTES
+
+
+def test_not_truncated_at_exactly_the_cap(box: Sandbox):
+    command = box.script(
+        "exact.py", f"import sys\nsys.stdout.write('x' * {tools.MAX_STREAM_BYTES})\n"
+    )
+    result = tools.shell_exec(command)
+    assert len(result["stdout"]) == tools.MAX_STREAM_BYTES
     assert result["truncated"] is False
+
+
+def test_escaping_cannot_push_the_result_past_the_budget(box: Sandbox):
+    """`\\n` and `\\t` double when escaped; the budget is measured after it.
+
+    A raw-byte cap alone would let two 24 KiB streams become 96 KiB of JSON and
+    overflow the frame, so the fit is asserted on the serialised result. Both
+    streams keep a share: an escape-heavy pair must not be solved by emptying
+    one of them.
+    """
+    command = box.script(
+        "escapes.py",
+        "import sys\n"
+        "sys.stdout.write('\\n' * 24_576)\n"
+        "sys.stderr.write('\\t' * 24_576)\n",
+    )
+    result = tools.shell_exec(command)
+    assert result["truncated"] is True
+    assert _result_bytes(result) <= tools.MAX_RESULT_BYTES
+    assert set(result["stdout"]) <= {"\n"}
+    assert set(result["stderr"]) <= {"\t"}
+    assert len(result["stdout"]) > 0
+    assert len(result["stderr"]) > 0
+
+
+def test_a_small_stream_survives_a_flooding_one(box: Sandbox):
+    """Trimming takes from the flood, never from the one useful line."""
+    command = box.script(
+        "mixed.py",
+        "import sys\n"
+        "sys.stdout.write('o' * 200_000)\n"
+        "sys.stderr.write('err\\n')\n",
+    )
+    result = tools.shell_exec(command)
+    assert result["stderr"] == "err\n"
+    assert len(result["stdout"]) <= tools.MAX_STREAM_BYTES
+    assert result["truncated"] is True
 
 
 def test_a_flooding_command_still_finishes(box: Sandbox):
@@ -366,7 +437,7 @@ def test_a_flooding_command_still_finishes(box: Sandbox):
     elapsed = time.monotonic() - started
     assert result["exit_code"] == 0
     assert result["truncated"] is True
-    assert len(result["stdout"]) == tools.MAX_OUTPUT_BYTES
+    assert len(result["stdout"]) <= tools.MAX_STREAM_BYTES
     assert elapsed < 15, f"draining took {elapsed:.1f}s"
 
 

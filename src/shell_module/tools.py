@@ -15,9 +15,11 @@ The module exists for its four boundaries, not for `exec`:
 3. **time** — `timeout_s` in `[1, 120]`; on expiry the whole process group is
    SIGKILLed and the call returns `timed_out=true` instead of raising. A
    grandchild that outlives its parent dies with the group.
-4. **size** — stdout and stderr keep the first 64 KiB each. The pipes are
-   still *drained to EOF* and the surplus discarded; if we stopped reading, the
-   child would block on a full pipe and `wait()` would hang forever.
+4. **size** — stdout and stderr share one 48 KiB result budget (24 KiB each
+   before the JSON fit; `MAX_RESULT_BYTES`), because a v1 frame carries 65519
+   bytes and a result that does not fit is a fatal call. The pipes are still
+   *drained to EOF* and the surplus discarded; if we stopped reading, the child
+   would block on a full pipe and `wait()` would hang forever.
 
 The child does not inherit the module's environment: a command must not be able
 to read `MODULE_KEY_PATH` / `CORE_PUBLIC_KEY` with `env`. It gets a small,
@@ -32,6 +34,7 @@ isolation comes from the container (uid 10001, no writable layer outside
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -44,8 +47,10 @@ from typing import Any, Callable
 __all__ = [
     "tool",
     "ToolFailure",
-    "MAX_OUTPUT_BYTES",
+    "MAX_RESULT_BYTES",
+    "MAX_STREAM_BYTES",
     "MAX_COMMAND_BYTES",
+    "FRAME_PLAINTEXT_BYTES",
     "MIN_TIMEOUT_S",
     "MAX_TIMEOUT_S",
     "configured_roots",
@@ -57,9 +62,24 @@ __all__ = [
     "all_tools",
 ]
 
-#: Per-stream cap. 64 KiB is ~16k tokens of English: enough to see a traceback
-#: or a test summary, small enough that one call cannot eat the context window.
-MAX_OUTPUT_BYTES = 64 * 1024
+#: Budget for one *tool result*, measured on the JSON the SDK actually sends
+#: (`json.dumps(..., ensure_ascii=False, separators=(",", ":"))`). A v1 frame
+#: carries at most 65519 plaintext bytes and v1 has no fragmentation, so the
+#: budget leaves ~16 KiB for the JSON-RPC envelope, the duration/error fields
+#: and the Noise tag. stdout and stderr share this one budget: a result that
+#: looks fine locally but cannot be framed is a fatal call, not a big answer.
+MAX_RESULT_BYTES = 48 * 1024
+
+#: Per-stream share, before the JSON fit: a fixed half each. Fixed on purpose —
+#: a split decided by whichever pipe the scheduler drained first would make the
+#: same command return different bytes on different runs.
+MAX_STREAM_BYTES = MAX_RESULT_BYTES // 2
+
+#: One plaintext frame of the v1 transport is 65519 bytes and v1 has no
+#: fragmentation. Kept as a documented constant next to `MAX_RESULT_BYTES` so
+#: the reason for the 48 KiB budget is visible to readers instead of being
+#: rediscovered in production.
+FRAME_PLAINTEXT_BYTES = 65_519
 
 #: One argv string above this cannot be executed on Linux anyway (a single
 #: argument is capped at 128 KiB by the kernel); refusing early is honest.
@@ -416,6 +436,63 @@ def _pump(stream: Any, sink: _Capture) -> None:
             pass
 
 
+def _json_bytes(value: Any) -> int:
+    """Size of `value` as the SDK serialises it: compact, non-ASCII kept."""
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _fit_result(
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    timed_out: bool,
+    cut: bool,
+) -> dict[str, Any]:
+    """Assemble the result, trimming text until the whole JSON fits the budget.
+
+    The per-stream caps bound *raw* bytes; escaping is what can still push a
+    result past the frame (`\\n` costs two bytes, a replaced byte three). A pair
+    that fits is returned untouched; otherwise each stream is held to its own
+    half of the frame — measured with the envelope, so the two halves plus the
+    skeleton can never add up to more than `MAX_RESULT_BYTES`. A stream already
+    inside its half is kept whole: slack is not spent on the other side, which
+    is what keeps the split independent of who wrote more.
+    """
+    total_out, total_err = len(stdout), len(stderr)
+
+    def build(out: str, err: str) -> dict[str, Any]:
+        return {
+            "exit_code": exit_code,
+            "stdout": out,
+            "stderr": err,
+            # `cut` is the capture verdict (bytes past the per-stream cap were
+            # dropped); the length checks catch a trim made here.
+            "truncated": cut or len(out) < total_out or len(err) < total_err,
+            "timed_out": timed_out,
+        }
+
+    def longest_prefix(text: str, fits: Callable[[str], bool]) -> str:
+        """Longest prefix of `text` satisfying `fits` (monotone in length)."""
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(text[:middle]):
+                low = middle
+            else:
+                high = middle - 1
+        return text[:low]
+
+    if _json_bytes(build(stdout, stderr)) <= MAX_RESULT_BYTES:
+        return build(stdout, stderr)
+
+    # Over budget: give each stream its half, skeleton included. Trimming one
+    # stream to fit around the other would empty it when both are escape-heavy.
+    half = MAX_RESULT_BYTES // 2
+    stdout = longest_prefix(stdout, lambda candidate: _json_bytes(build(candidate, "")) <= half)
+    stderr = longest_prefix(stderr, lambda candidate: _json_bytes(build("", candidate)) <= half)
+    return build(stdout, stderr)
+
+
 # ------------------------------------------------------------------------ spawn
 
 
@@ -463,7 +540,7 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
 @tool(
     "shell_exec",
     "在受限工作目录中执行单个命令（不经过 shell）：返回 exit_code/stdout/stderr；"
-    "超时 kill 整个进程组并返回 timed_out=true；每个流最多 64 KiB",
+    "超时 kill 整个进程组并返回 timed_out=true；stdout+stderr 合计最多 48 KiB（含 JSON 信封）",
     risk="high",
     timeout_ms=130_000,
     idempotent=False,
@@ -472,9 +549,10 @@ def shell_exec(command: str, timeout_s: int = 30, cwd: str = ".") -> dict[str, A
     """Run one command. A non-zero exit is a result, not an error.
 
     `exit_code` is the child's status; on timeout it is `-9` (SIGKILL) and
-    `timed_out` is true. `truncated` is true when either stream exceeded
-    `MAX_OUTPUT_BYTES` — the command still ran to completion, only the copy we
-    keep is short.
+    `timed_out` is true. `truncated` is true when either stream exceeded its
+    `MAX_STREAM_BYTES` share, or when the two together still did not fit
+    `MAX_RESULT_BYTES` once escaped as JSON — the command still ran to
+    completion, only the copy we keep is short.
     """
     timeout = _require_int(timeout_s, "timeout_s")
     if not (MIN_TIMEOUT_S <= timeout <= MAX_TIMEOUT_S):
@@ -488,8 +566,8 @@ def shell_exec(command: str, timeout_s: int = 30, cwd: str = ".") -> dict[str, A
     real, _root, _relative_cwd = resolve_cwd(cwd)
 
     proc = _spawn(argv, real, _child_env(real))
-    out = _Capture(MAX_OUTPUT_BYTES)
-    err = _Capture(MAX_OUTPUT_BYTES)
+    out = _Capture(MAX_STREAM_BYTES)
+    err = _Capture(MAX_STREAM_BYTES)
     pumps = [
         threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
         threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
@@ -518,13 +596,13 @@ def shell_exec(command: str, timeout_s: int = 30, cwd: str = ".") -> dict[str, A
         thread.join(timeout=5)
 
     exit_code = proc.returncode if proc.returncode is not None else -1
-    return {
-        "exit_code": exit_code,
-        "stdout": out.text(),
-        "stderr": err.text(),
-        "truncated": out.truncated or err.truncated,
-        "timed_out": timed_out,
-    }
+    return _fit_result(
+        exit_code,
+        out.text(),
+        err.text(),
+        timed_out=timed_out,
+        cut=out.truncated or err.truncated,
+    )
 
 
 @tool(

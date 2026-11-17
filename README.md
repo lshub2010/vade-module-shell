@@ -2,8 +2,8 @@
 
 在白名单工作目录内执行**单个命令**，不经过 shell。模块的价值不在 `exec`，
 而在四条边界：**cwd**（越界拒绝）、**无 shell**（管道/拼接拒绝而不是当参数传下去）、
-**时间**（超时杀整个进程组并返回 `timed_out`）、**大小**（每个流 64 KiB，超出部分
-边读边丢，绝不因写满管道而卡死）。
+**时间**（超时杀整个进程组并返回 `timed_out`）、**大小**（stdout+stderr 合计 48 KiB，
+含 JSON 信封；超出部分边读边丢，绝不因写满管道而卡死）。
 
 ## 工具
 
@@ -18,7 +18,8 @@
   或"参数不合法"才是错误。
 - `stdout` / `stderr`：UTF-8 文本，非法字节替换为 `U+FFFD`（命令可能输出二进制，
   这不是失败的理由）。
-- `truncated`：任一流超过 64 KiB 时为 `true`。此时命令**仍然跑完了**，只是返回的
+- `truncated`：任一流被截断时为 `true`——单流超过自己的一半（24 KiB）、双流合计
+  超过 48 KiB、或 JSON 转义后超预算，都算。此时命令**仍然跑完了**，只是返回的
   副本变短。
 - `timed_out`：**总是存在**。超时为 `true`，此时 `exit_code` 是 `-9`（SIGKILL）。
   超时不抛错——模型需要看到"它没跑完"，而不是一个看不出发生什么的异常。
@@ -91,15 +92,31 @@ PATH 里永远没有空串 / `.`，否则沙箱内一个同名文件就能顶替
 杀完最多等 5 秒；然后对两个读线程做**有界 join**（5 秒）。如果某个逃出进程组的
 孙进程还握着管道，调用也必须返回——"输出停了"不能变成"调用挂了"。
 
-### 5. 输出上限
+### 5. 输出预算
 
 | 上限 | 值 | 行为 |
 |---|---|---|
-| stdout | 64 KiB | 保留前 64 KiB，`truncated=true` |
-| stderr | 64 KiB | 同上（两个独立配额） |
+| stdout + stderr 合计 | 48 KiB | 一个预算，两个流共用；`truncated=true` |
+| 其中单个流 | 24 KiB | 固定一半，超出的字节边读边丢 |
+| 整个 JSON 结果 | 48 KiB | 转义之后再量一遍（`MAX_RESULT_BYTES`） |
 | 命令字符串 | 32 KiB | `PAYLOAD_TOO_LARGE` |
 
-**截断之后仍然读到 EOF**：管道被读空、多余字节丢弃。若在 64 KiB 处停止读取，子进程
+**为什么是 48 KiB**：v1 一帧明文 65519 字节（`FRAME_PLAINTEXT_BYTES`）且没有分片。
+两个流各 64 KiB 时，单个流的 JSON 包装就已经超帧——这样的结果不是"长"，是
+**发不出去**，transport 会以 `PAYLOAD_TOO_LARGE` fatal 断链。预算把信封也算进去，
+剩下约 16 KiB 给 RPC 字段、错误/耗时字段和 Noise tag。
+
+**两个流固定各一半**：24576 字节一份，**不按"谁先到谁多拿"分配**——那会让同一条
+命令在不同运行里返回不同的字节。预算守恒，不因为另一个流短就变多。
+
+**转义会改变大小**：`\n` 在 JSON 里占两个字节，被替换的非法字节占三个。所以
+24 KiB + 24 KiB 的裸字节不等于 48 KiB 的 JSON。`_fit_result` 按 SDK 真正的序列化
+方式（`ensure_ascii=False, separators=(",", ":")`）量整个结果：装得下就原样返回；
+装不下就**把每个流各自钉在自己那一半（含信封）以内**——超出的二分截断，本来就在
+半份之内的流整条保留。`truncated` 因此有三个来源——单流超配额、双流合计超预算、
+转义后超预算——任一成立就是 `true`。
+
+**截断之后仍然读到 EOF**：管道被读空、多余字节丢弃。若在配额处停止读取，子进程
 会写满管道后永久阻塞，`wait()` 就再也不会返回。`test_a_flooding_command_still_finishes`
 用 4 MB 输出钉住这条（并且断言耗时正常，不是"刚好没超时"）。
 
@@ -138,17 +155,19 @@ SHELL_ALLOWLIST=python3:pytest:git    # ':' 分隔；空/未设置 = 不限制
 
 ## Frame ceiling（部署前必读）
 
-v1 传输没有分片，一帧明文上限 65519 字节（`limits.max_payload`）。本模块
-stdout/stderr **各 64 KiB 是本地上限**（防内存与上下文放大），但 64 KiB 的单个流
-JSON 包装后就已经超过一帧：这样的结果**发不出去**，transport 会以
-`PAYLOAD_TOO_LARGE` 断开（fatal）。
+v1 传输**没有分片**，一帧明文上限 65519 字节（`FRAME_PLAINTEXT_BYTES`），
+`limits.max_payload` 也就报到 65519。本模块的结果预算 `MAX_RESULT_BYTES = 48 KiB`
+是**按整个 JSON 结果**量的：stdout + stderr + 信封之后仍留约 16 KiB 给 RPC 字段、
+错误/耗时字段和 Noise tag。
 
-所以连 core 部署时，单次调用实际可送达的输出约 **60 KiB 总量**（stdout + stderr +
-JSON 包装共用一帧）。这是有意的取舍：截断阈值不随部署方式变化，`truncated` 的语义
-在哪里都一致。需要更多输出时，让命令把结果写进根目录里的文件，再用 `fs_read`
-分块读回来——shell 只负责跑，不负责搬运大块数据。
+所以在 core 后面部署**不需要另外调小输出**：`shell_exec` 的结果一定能装进一帧，
+装不下的部分在模块里就被截断并标 `truncated=true`，而不是让 transport 在
+`payload > 65519` 时 fatal 断链。这条是正确性，不是优化——一次合法的工具调用
+不该因为"命令话多"而杀死连接。需要更多输出时，让命令把结果写进根目录里的文件，
+再用 `fs_read` 分块读回来：shell 只负责跑，不负责搬运大块数据。
 
-`--standalone` 不经过 transport，不受此限。
+`--standalone` 不经过 transport，但预算不变——阈值不随部署方式变化，`truncated`
+的语义在哪里都一致。
 
 ## 布局
 
@@ -179,7 +198,7 @@ modules/shell/
 pip install -e sdk/python          # 或 pip install "vade-sdk==0.1.*"
 pip install -e modules/shell
 
-pytest modules/shell/tests -q      # 77 passed（无 core；无 SDK 时 server 测试 skip）
+pytest modules/shell/tests -q      # 80 passed（无 core；无 SDK 时 server 测试 skip）
 python -m shell_module --check     # exit 0，并把 manifest 打到 stdout
 
 SHELL_ROOTS=/data/workspace \

@@ -2,7 +2,7 @@
   "capabilities": {
     "tools": [
       {
-        "description": "在受限工作目录中执行单个命令（不经过 shell）：返回 exit_code/stdout/stderr；超时 kill 整个进程组并返回 timed_out=true；每个流最多 64 KiB",
+        "description": "在受限工作目录中执行单个命令（不经过 shell）：返回 exit_code/stdout/stderr；超时 kill 整个进程组并返回 timed_out=true；stdout+stderr 合计最多 48 KiB（含 JSON 信封）",
         "idempotent": false,
         "input_schema": {
           "additionalProperties": false,
